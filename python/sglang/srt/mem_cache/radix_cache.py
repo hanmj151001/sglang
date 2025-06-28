@@ -160,6 +160,8 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
+
+    # 在基数树中查找与输入token序列匹配的最长前缀，返回对应的KV缓存索引
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
@@ -171,6 +173,7 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+        # 如果基数树 被禁用 或者 输入为 0
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
@@ -183,10 +186,16 @@ class RadixCache(BasePrefixCache):
             )
 
         if self.page_size != 1:
+            # 页对齐向下取整 的做法
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
-
+        
+        # 核心匹配算法
+        # 调用核心算法，在树中查找最长匹配前缀
+        # 返回匹配的KV缓存列表和最后到达的节点
         value, last_node = self._match_prefix_helper(self.root_node, key)
+
+        # 匹配到返回匹配值, 没有匹配到返回空值
         if value:
             value = torch.cat(value)
         else:
@@ -204,9 +213,11 @@ class RadixCache(BasePrefixCache):
         if value is None:
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
-
+    
+    # 当一个LLM推理请求完全处理完成后，将该请求的KV缓存数据存储到基数树中，以便后续请求重用
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
+        # 如果禁用, 释放掉所有资源
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -215,7 +226,9 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
+        # 输入的token 和 输出的token
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        # 在请求池中获取对应的KV缓存索引
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -231,6 +244,7 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
+        # 插入基数树, 并且注册事件
         new_prefix_len = self.insert(
             token_ids[:page_aligned_len], page_aligned_kv_indices
         )
@@ -294,26 +308,34 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+#   删除num_tokens大小的容量 
     def evict(self, num_tokens: int):
         if self.disable:
             return
-
+        # 收集所有叶子节点
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
 
         num_evicted = 0
+        # 控制删除的节点数量 小于 num_tokens
         while num_evicted < num_tokens and len(leaves):
             x = heapq.heappop(leaves)
 
+#           如果是根节点则不删除
+            # 如果根节点的锁引用大于0，则不删除
             if x == self.root_node:
                 break
             if x.lock_ref > 0:
                 continue
-
+            
+            # 清理 GPU内的KV缓存 的显存
             self.token_to_kv_pool_allocator.free(x.value)
+            #  统计删除节点的数量
             num_evicted += len(x.value)
+            # 在基数树中删除叶子节点
             self._delete_leaf(x)
 
+            # 如果父节点没有子节点了，则将父节点加入到叶子节点列表中
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
@@ -370,18 +392,23 @@ class RadixCache(BasePrefixCache):
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
 
+        # 匹配 key 的第一个子节点的 key
         child_key = self.get_child_key_fn(key)
 
+        # 可以匹配到的值
         value = []
+        # 类似前缀树的前缀匹配
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
+            # 如果匹配的前缀长度小于子节点的key长度, 裂变拆分子节点
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
                 break
+            # 这个分支是当前完全匹配, 截断后继续子节点向下匹配
             else:
                 value.append(child.value)
                 node = child
@@ -392,6 +419,7 @@ class RadixCache(BasePrefixCache):
 
         return value, node
 
+    # 在基数树中拆分节点,注册事件
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
         self._record_remove_event(child)
@@ -462,6 +490,7 @@ class RadixCache(BasePrefixCache):
                     child.key
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
+#   在父节点中删除子节点, 
     def _delete_leaf(self, node):
         for k, v in node.parent.children.items():
             if v == node:
@@ -494,6 +523,7 @@ class RadixCache(BasePrefixCache):
 
         return ret_list
 
+    #  记录 kvcache 事件 对应的地址
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
@@ -527,6 +557,7 @@ class RadixCache(BasePrefixCache):
                 # Chain next chunk to this one.
                 parent_block_hash = block_hash
 
+    # 记录删除事件
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:

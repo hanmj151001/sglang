@@ -133,6 +133,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
+# 没有初始化函数 以及各类方法的类, 使用dataclass可以自动使用默认函数, 
+# 相当于 C++ 有默认的init函数等
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -179,6 +181,7 @@ class TokenizerManager:
         port_args: PortArgs,
     ):
         # Parse args
+        # 解析配置参数
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
@@ -189,6 +192,17 @@ class TokenizerManager:
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
+        self.crash_dump_performed = False  # Flag to ensure dump is only called once
+
+        # Init inter-process communication
+        # 初始化 ZMQ 通信
+        context = zmq.asyncio.Context(2)
+        self.recv_from_detokenizer = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True
+        )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -455,11 +469,20 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        # 确保事件循环运行
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        async with self._is_updating_cond:
-            await self._is_updating_cond.wait_for(lambda: not self._is_updating)
+        # 验证请求类型
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -467,8 +490,10 @@ class TokenizerManager:
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+        #  获取锁，确保模型更新时不会有请求
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
+
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
