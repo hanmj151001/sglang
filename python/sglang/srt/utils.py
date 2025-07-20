@@ -1093,8 +1093,8 @@ def point_to_point_pyobj(
     data: List[Any],
     rank: int,
     group: Optional[torch.distributed.ProcessGroup] = None,
-    src: int = 0,
-    dst: int = 1,
+    src: int = 0,  #发送方 rank
+    dst: int = 1, #接收方 rank
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
 
@@ -1104,9 +1104,11 @@ def point_to_point_pyobj(
                 [0], dtype=torch.long, device=torch.cuda.current_device()
             )
             dist.send(tensor_size, dst=dst, group=group)
-        else:
+        else: #发送数据 != 0
+            # 序列化数据
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
+            # 张量化数据
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
             ).cuda(
@@ -1115,7 +1117,7 @@ def point_to_point_pyobj(
             tensor_size = torch.tensor(
                 [size], dtype=torch.long, device=torch.cuda.current_device()
             )
-
+            # 发送数据
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
@@ -1129,12 +1131,13 @@ def point_to_point_pyobj(
 
         if size == 0:
             return []
-
+        # 当前数据大小不为0
         tensor_data = torch.empty(
             size, dtype=torch.uint8, device=torch.cuda.current_device()
         )
+        # 接收数据
         dist.recv(tensor_data, src=src, group=group)
-
+        # 反序列化数据
         serialized_data = bytes(
             tensor_data.cpu().numpy()
         )  # Move back to host for deserialization

@@ -918,30 +918,33 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+# 接收请求并在分布式来源进行同步
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
+        if self.pp_rank == 0: # 只有第一个Pipeline Parallel rank接收请求
+            if self.attn_tp_rank == 0: # 只有第一个Attention Tensor Parallel rank接收
                 recv_reqs = []
 
-                while True:
+                while True: # 从tokenizer manager接收请求
                     try:
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
 
-                while True:
+                while True:# 从RPC接收管理请求
                     try:
                         recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
-            else:
+            else: # 其他attn_tp_rank不接收，等待广播
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
+                # (self.pp_rank - 1) * self.tp_size + dp_offset 的rank进程中的python对象发送给
+                # self.pp_rank * self.tp_size + dp_offset 的rank进程
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
@@ -952,15 +955,13 @@ class Scheduler(
             else:
                 recv_reqs = None
 
-        if self.input_blocker is not None:
-            recv_reqs = self.input_blocker.handle(recv_reqs)
-
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention: #是否启用注意力 DP
             if self.attn_tp_rank == 0:
                 work_reqs = [
                     req
                     for req in recv_reqs
                     if isinstance(
+                        # 筛选生成任务 和 嵌入任务
                         req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                     )
                 ]
@@ -968,6 +969,7 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if not isinstance(
+                        # 不属于上面两个任务的任务
                         req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                     )
                 ]
@@ -1000,8 +1002,11 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        # 遍历上面的请求
         for recv_req in recv_reqs:
+
             # If it is a health check generation request and there are running requests, ignore it.
+            # 健康检查请求 和 有运行中的请求.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None or not self.running_batch.is_empty()
             ):
@@ -1029,6 +1034,7 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
 
+#   把请求打入到队列里面
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1388,6 +1394,7 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    # 从等待队列和运行批次中，决定下一个要在GPU上执行的批次。
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1646,6 +1653,7 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+#   模型的推理部分
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
